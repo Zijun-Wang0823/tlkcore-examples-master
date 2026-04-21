@@ -1,0 +1,9 @@
+﻿.vscode/
+__pycache__/
+*.pyc
+BeamTable/
+build/
+bin/
+obj/
+tlk_core_log/
+Thumbs.db

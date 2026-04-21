@@ -1,0 +1,4 @@
+psutil==6.1.0
+pyserial==3.5
+ft4222==1.10.0
+pybind11-global
