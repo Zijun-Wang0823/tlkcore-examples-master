@@ -1,4 +1,4 @@
-"""
+r"""
  _____            _   _ _                              ____    _____  ___
 |  ___|__  _ __  | |_| | | _____ ___  _ __ ___  __   _|___ \  |___ / / _ \   _
 | |_ / _ \| '__| | __| | |/ / __/ _ \| '__/ _ \ \ \ / / __) |   |_ \| | | |_| |_
@@ -978,6 +978,25 @@ def testRIS(sn, service):
                 i+=1
 
 def testBBoxDuo(sn, service):
+    logger.info("===== FBS probe on Duo (%s) =====", sn)
+    probes = [
+        ("getBeamIdStorage", lambda: service.getBeamIdStorage(sn)),
+        ("getBeamPattern",   lambda: service.getBeamPattern(sn, RFMode.TX, 1)),
+        ("setBeamPattern",   lambda: service.setBeamPattern(
+                                sn, RFMode.TX, 1, BeamType.BEAM,
+                                {'db': 0, 'theta': 0, 'phi': 0})),
+        ("setFastParallelMode", lambda: service.setFastParallelMode(sn, True)),
+        ("getBeamGainList",  lambda: service.getBeamGainList(sn)),
+        ("getBeamPhaseList", lambda: service.getBeamPhaseList(sn)),
+        ("getAAKitInfo",     lambda: service.getAAKitInfo(sn)),
+        ("getAAKitList",     lambda: service.getAAKitList(sn)),
+    ]
+    for name, call in probes:
+        try:
+            logger.info("  %-22s -> %s", name, call())
+        except Exception as e:
+            logger.info("  %-22s -> EXCEPTION %s", name, e)
+
     logger.info("MAC: %s" %service.queryMAC(sn))
     logger.info("Static IP: %s" %service.queryStaticIP(sn))
 
@@ -998,7 +1017,7 @@ def testBBoxDuo(sn, service):
     ret = service.getTRx(sn).RetData
     logger.info("Get TRx status: %s" % ret)
 
-    ret = service.checkHarmonic(sn, lo_freq = 22500000, if_freq = 5000000, bandwidth = 2000000).RetData
+    ret = service.checkHarmonic(sn, lo_freq = 22800000, if_freq = 5200000, bandwidth = 675000).RetData
     logger.info("Check Harmonic: %s" % ret)
 
     logger.info("========= BBox Duo Set functions =========")
@@ -1006,23 +1025,48 @@ def testBBoxDuo(sn, service):
     ret = service.setRfFreq(sn, 28000000).RetData
     logger.info("Set RF freq to 28000000 kHz: %s" % ret)
 
-    ret = service.setLoFreq(sn, 22500000).RetData
-    logger.info("Set LO freq to 22500000 kHz: %s" % ret)
+    ret = service.setLoFreq(sn, 22800000).RetData
+    logger.info("Set LO freq to 22800000 kHz: %s" % ret)
 
     ret = service.setRefSource(sn, 0).RetData
-    logger.info("Set Ref source to External 10M: %s" % ret)
+    logger.info("Set Ref source to INTERNAL: %s" % ret)
 
-    ret = service.setBeam(sn, theta = 30, phi = 60).RetData
-    logger.info("Set Beam to theta=30, phi=60: %s" % ret)
+    ret = service.setBeam(sn, theta = 0, phi = 0).RetData
+    logger.info("Set Beam to theta=0, phi=0: %s" % ret)
 
-    ret = service.setTRx(sn, 2).RetData
-    logger.info("Set TRx to 2 (RX): %s" % ret)
+    TX_SN = "BDA-2550009-2800"   
+    RX_SN = "BDA-2550019-2800"  
 
-    ret = service.setRxUdAtt(sn, 0).RetData
-    logger.info("Set RX user attenuation to 0: %s" % ret)
+    if sn == TX_SN:
+        role = 1          # TX
+    elif sn == RX_SN:
+        role = 2          # RX
+    else:
+        role = 2          # 其它（没接的）默认 RX
+    # ret = service.setTRx(sn, role).RetData
+    # logger.info("Set TRx to %s (%s): %s" % (role, "TX" if role == 1 else "RX", ret))
 
-    ret = service.setTxUdAtt(sn, 0).RetData
-    logger.info("Set TX user attenuation to 0: %s" % ret)
+
+    # ret = service.setRxUdAtt(sn, 0).RetData
+    # logger.info("Set RX user attenuation to 0: %s" % ret)
+
+    # ret = service.setTxUdAtt(sn, 0).RetData
+    # logger.info("Set TX user attenuation to 0: %s" % ret)
+
+    ret = service.setTRx(sn, role).RetData
+    logger.info("Set TRx to %s (%s): %s" % (role, "TX" if role == 1 else "RX", ret))
+
+    time.sleep(0.1)                                    # 给硬件切换 + PLO 重锁时间
+
+    if role == 1:   # TX
+        ret = service.setTxUdAtt(sn, 0)
+        logger.info("Set TX att=0: RetCode=%s RetMsg=%s RetData=%s"
+                    % (ret.RetCode, ret.RetMsg, ret.RetData))
+    elif role == 2: # RX
+        ret = service.setRxUdAtt(sn, 0)
+        logger.info("Set RX att=0: RetCode=%s RetMsg=%s RetData=%s"
+                    % (ret.RetCode, ret.RetMsg, ret.RetData))
+
 
 def startDFU(sn, service, dfu_image:str, dfu_dev_info:dict):
     """A example to process DFU"""
