@@ -1,0 +1,516 @@
+clear all; clc; close all;
+set(0, 'DefaultFigureWindowStyle', 'normal');
+
+%% ----------------- 1. 参数定义 -----------------
+M   = 16; k = log2(M); sps = 2;
+Rs  = 1e6/sps; Fs = Rs*sps;
+rolloff = 0.35; span = 10;
+NpadSym = 100;
+
+Npreamble = 2048; Lrep = 32; Nstf = 1024; Nltf = Npreamble - Nstf; NtrainSym = 2000;
+
+PilotSpacing = 10;
+NumDataBlocks = 400;
+LenDataBlock = PilotSpacing - 1;
+NdataSymTotal = NumDataBlocks * LenDataBlock;
+
+FixedPilotVal = (1+1j)/sqrt(2);
+% rng(7);
+
+%% ----------------- 2. 初始化 -----------------
+repBlock = pskmod(randi([0 3], Lrep, 1), 4, pi/4);
+stfSym   = repmat(repBlock, Nstf/Lrep, 1);
+ltfSym   = pskmod(randi([0 3], Nltf, 1), 4, pi/4);
+preambleSym = [stfSym; ltfSym];
+
+txRRC = comm.RaisedCosineTransmitFilter("RolloffFactor", rolloff, ...
+    "FilterSpanInSymbols", span, "OutputSamplesPerSymbol", sps);
+rxRRC = comm.RaisedCosineReceiveFilter("RolloffFactor", rolloff, ...
+    "FilterSpanInSymbols", span, "InputSamplesPerSymbol", sps, "DecimationFactor", 1);
+agc = comm.AGC("AveragingLength", 100, "DesiredOutputPower", 1, "MaxPowerGain", 60);
+
+%% ----------------- 3. USRP X410 配置 -----------------
+radioID   = "tempRadio";
+fc_Hz     = 5.2e9;
+txGain_dB = 10;
+rxGain_dB = 0;
+
+txAntenna = "DB0:RF0:TX/RX0";
+rxAntenna = "DB0:RF0:RX1";
+
+bbtrx = basebandTransceiver(radioID, ...
+    TransmitAntennas=txAntenna, ...
+    CaptureAntennas=rxAntenna, ...
+    DroppedSamplesAction="warning", ...
+    TransmitDataType="single", ...
+    CaptureDataType="single");
+
+bbtrx.SampleRate              = Fs;
+bbtrx.TransmitCenterFrequency = fc_Hz;
+bbtrx.CaptureCenterFrequency  = fc_Hz;
+bbtrx.TransmitRadioGain       = txGain_dB;
+bbtrx.CaptureRadioGain        = rxGain_dB;
+
+% 退出时尽力停发射
+cleanupObj = onCleanup(@()cleanupRadio(bbtrx));
+
+saveFile = fullfile(pwd, ['rxDistanceinch_' datestr(now,'yyyymmdd_HHMMSS') '.mat']);
+rx_frames = {};
+fprintf('RX frames will be saved to:\n%s\n', saveFile);
+
+%% ----------------- 4. GUI 窗口 -----------------
+f = figure('Name', 'Real-Time 64QAM OTA (X410)', 'Color', 'w', ...
+    'NumberTitle', 'off', 'MenuBar', 'none');
+ax = axes('Parent', f);
+hScatter = plot(ax, 0, 0, '.', 'MarkerSize', 6);
+grid(ax, 'on');
+axis(ax, 'square');
+axis(ax, [-2 2 -2 2]);
+xlabel(ax, 'I');
+ylabel(ax, 'Q');
+title(ax, 'Initializing...');
+
+% 关窗口停发射
+f.CloseRequestFcn = @(src,evt)closeFigureStopTx(src, bbtrx);
+
+%% ----------------- 5. 先生成一帧并 continuous 发射 -----------------
+% 帧结构：pad + preamble + train + payload
+padSym = pskmod(randi([0 3], NpadSym, 1), 4, pi/4);
+
+trainBits = randi([0 1], NtrainSym*k, 1);
+trainSym = qammod(trainBits, M, "InputType","bit", "UnitAveragePower", true);
+
+dataBits = randi([0 1], NdataSymTotal*k, 1);
+dataSymRaw = qammod(dataBits, M, "InputType","bit", "UnitAveragePower", true);
+
+dataMatrix = reshape(dataSymRaw, LenDataBlock, NumDataBlocks);
+pilotRow   = repmat(FixedPilotVal, 1, NumDataBlocks);
+payloadSym = reshape([dataMatrix; pilotRow], [], 1);
+
+% guard，避免 continuous 粘帧
+txSym = [padSym; preambleSym; trainSym; payloadSym; zeros(4*span,1)];
+
+reset(txRRC);
+txWave = txRRC(txSym);
+
+% scale
+txWave = txWave / (max(abs(txWave)) + 1e-12);
+txWave = single(0.7 * txWave);
+
+frameLenSamp = length(txWave);
+capLen = 3 * frameLenSamp;  % 抓长一点，保证含一整帧
+
+% transmit(bbtrx, txWave, "continuous");  % continuous 发射
+
+% %% ----------------- 6. 主循环 -----------------
+% frameCount = 0;
+% while ishandle(f)
+%     frameCount = frameCount + 1;
+% 
+%     try
+%         [rx, ~, droppedSamples] = capture(bbtrx, capLen);
+%         if droppedSamples
+%             fprintf('[WARN] Dropped samples occurred during capture.\n');
+%         end
+%         if size(rx,2) > 1
+%             rx = rx(:,1);
+%         end
+% 
+%         % Debug 1
+%         rx0 = rx(:,1);
+%         rx0 = rx0 - mean(rx0);
+%         P_rx = mean(abs(rx0).^2);
+%         P_rx_dB = 10*log10(P_rx + 1e-12);
+%         fprintf("RX raw power = %.6g, %.2f dB\n", P_rx, P_rx_dB);
+%         rmsv = sqrt(mean(abs(rx0).^2));
+%         pk   = max(abs(rx0));
+%         clip = mean(abs(rx0) > 0.98);
+% 
+%         fprintf("RX raw: rms=%.4g, pk=%.3f, clip=%.2f%%\n", rmsv, pk, 100*clip);
+%         % Debug 1
+% 
+%         % --- Rx 处理 ---
+%         reset(agc);
+%         reset(rxRRC);
+%         % rx = agc(rx - mean(rx)); % 拉平均功率
+%         rx = rx - mean(rx);
+% 
+%         rx_frames{end+1,1} = rx;
+%         save(saveFile, 'rx_frames', 'Fs', '-v7.3');
+% 
+%         % rx_freq = fftshift(fft(rx));
+%         % freq = linspace(-length(rx)/2*Fs/length(rx), Fs/length(rx)*(length(rx)/2-1), length(rx));
+%         % % freq = (-N/2:N/2-1) * (Fs/N);
+%         % figure(100);
+%         % plot(freq/1e6, 10*log10(abs(rx_freq) + 1e-12));
+%         % grid on;
+%         % ylabel('power(dB)');
+%         % xlabel('frequency (MHz)');
+%         % title(sprintf('Spectrum | saved %d frames', numel(rx_frames)));
+% 
+%         Nfft = length(rx);
+%         rx_freq = fftshift(fft(rx, Nfft));
+%         freq = (-Nfft/2:Nfft/2-1).' * (Fs/Nfft);
+% 
+%         % -------- Power spectrum --------
+%         specPow = abs(rx_freq).^2 / Nfft;   % linear power spectrum
+% 
+%         figure(100);
+%         plot(freq/1e6, 10*log10(specPow + 1e-12));
+%         grid on;
+%         ylabel('Power (dB)');
+%         xlabel('Frequency (MHz)');
+%         title(sprintf('Spectrum | saved %d frames', numel(rx_frames)));
+% 
+%         % -------- Standard FFT-based SNR --------
+%         % For RRC-shaped QAM, approximate occupied bandwidth:
+%         Bsig = Rs * (1 + rolloff);     % total occupied bandwidth
+% 
+%         % Signal band around DC
+%         sigMask = abs(freq) <= Bsig/2;
+% 
+%         % Noise estimated from out-of-band region
+%         noiseMask = ~sigMask;
+% 
+%         noisePSD = mean(specPow(noiseMask));              % average noise/bin
+%         noisePow_inBand = noisePSD * sum(sigMask);        % noise inside signal band
+%         totalPow_inBand = sum(specPow(sigMask));          % total measured in-band power
+%         sigPow = max(totalPow_inBand - noisePow_inBand, 1e-12);
+% 
+%         snrSpec_dB = 10*log10(sigPow / (noisePow_inBand + 1e-12));
+%         fprintf('Spectrum-based SNR = %.2f dB\n', snrSpec_dB);
+%         % % Debug 5
+%         % useAGC = false;  % 先关掉做对照
+%         % if useAGC
+%         %     reset(agc);
+%         %     rx = agc(rx);
+%         % else
+%         %     rx = rx ./ (sqrt(mean(abs(rx).^2)) + 1e-12); % 固定归一化
+%         % end
+%         % % Debug 5
+%         rxMF = rxRRC(rx); % 匹配滤波
+% 
+%         % ====== STF粗同步：锁峰值 ======
+%         Ls = Lrep * sps;
+%         searchSamp = length(rxMF) - 2*Ls - 1;
+%         if searchSamp <= 0, continue; end
+% 
+%         P = complex(zeros(searchSamp,1,'like',rxMF));
+%         R = zeros(searchSamp,1,'like',real(rxMF));
+% 
+%         for m = 1:2:searchSamp
+%             a = rxMF(m:m+Ls-1);
+%             b = rxMF(m+Ls:m+2*Ls-1);
+%             P(m) = sum(b .* conj(a));
+%             R(m) = sum(abs(b).^2);
+%         end
+% 
+%         Mstf = (abs(P).^2) ./ (R.^2 + 1e-9);
+% 
+%         % 屏蔽前段静默区
+%         maskLen = 50 * sps;
+%         if maskLen < length(Mstf)
+%             Mstf(1:maskLen) = 0;
+%         end
+% 
+%         % Debug 4
+%         needSamp = (Npreamble + NtrainSym + length(payloadSym) + 4*span + 200) * sps; % 200是余量
+%         tail0 = max(1, length(Mstf) - needSamp);
+%         Mstf(tail0:end) = 0;   % 尾部不允许作为STF峰
+%         % Debug 4
+% 
+%         [maxVal, mMax] = max(Mstf);
+% 
+%         fprintf("STF maxVal=%.4f, mMax=%d\n", maxVal, mMax);
+%         if maxVal < 0.2
+%             set(hScatter, 'XData', real(rxMF(1:min(2000,end))), ...
+%                           'YData', imag(rxMF(1:min(2000,end))));
+%             title(ax, 'No Signal Detected');
+%             drawnow limitrate;
+%             continue;
+%         end
+% 
+%         idxCFO = mMax : 2 : min(mMax + 10*Ls, searchSamp);   % 只取真正计算过的奇数点
+%         CFO_est = angle(mean(P(idxCFO))) * Fs/(2*pi*Ls);
+% 
+%         n4 = (0:length(rxMF)-1).';
+%         rxMF_cfo = rxMF .* exp(-1j*2*pi*CFO_est*n4/Fs);
+% 
+%         % ====== LTF精同步 ======
+%         bestScore = -Inf; best = struct();
+% 
+%         for tau = 0:0.5:(sps-1)
+%             r = sample1sps_interp(rxMF_cfo, tau, sps);
+% 
+%             approxLtfStart = round(mMax/sps) + Nstf;   % 从STF平台跳到LTF附近
+%             approxLtfStart = min(max(approxLtfStart, 1), length(r) - Nltf + 1);
+%             sMin = max(1, approxLtfStart - 200);
+%             sMax = min(length(r) - Nltf + 1, approxLtfStart + 300);
+% 
+%             if sMax <= sMin, continue; end
+% 
+%             c = conv(r(sMin:sMax+Nltf-1), flipud(conj(ltfSym)));
+%             [~, rel] = max(abs(c));
+%             ltfStart = sMin + rel - Nltf;
+%             ltfEnd   = ltfStart + Nltf - 1;
+%             if ltfStart < 1 || ltfEnd > length(r), continue; end
+% 
+%             xwin = r(ltfStart:ltfEnd);
+%             rho = abs(sum(xwin .* conj(ltfSym))) / sqrt((sum(abs(xwin).^2)*sum(abs(ltfSym).^2)) + 1e-12);
+% 
+%             if rho > bestScore
+%                 bestScore = rho;
+%                 best.tau = tau;
+%                 best.trainStart = ltfStart + Nltf;
+%             end
+%         end
+% 
+%         if isfield(best,'tau')
+%             fprintf("LTF best rho=%.3f, bestTau=%.1f\n", bestScore, best.tau);
+%         else
+%             fprintf("LTF best rho=%g (no lock)\n", bestScore);
+%         end
+% 
+%         if ~isfinite(bestScore) || bestScore < 0.35
+%             continue;
+%         end
+%         if ~isfield(best,'trainStart')
+%             continue;
+%         end
+% 
+%         % ====== 均衡与追踪 ======
+%         t0 = round((1 + best.tau) + (best.trainStart-1)*sps);
+%         Ntot = NtrainSym + length(payloadSym);
+%         fprintf("t0=%d, Ntot=%d, rxMF_len=%d\n", t0, Ntot, length(rxMF_cfo));
+%         if t0 + Ntot*sps > length(rxMF_cfo), continue; end
+% 
+%         rxEq = fse_nlms_train_only(rxMF_cfo, t0, sps, Ntot, trainSym, 61, 0.35);
+%         g = sum(rxEq(1:NtrainSym).*conj(trainSym)) / (sum(abs(trainSym).^2) + 1e-12);
+%         rxEq = rxEq / (g + 1e-12);
+% 
+%         % ===== IQ imbalance LS估计（训练段）=====
+%         rxTr = rxEq(1:NtrainSym);
+%         sTr  = trainSym;
+%         ab = [sTr, conj(sTr)] \ rxTr;
+%         a = ab(1); b = ab(2);
+%         IRR = 20*log10(abs(a)/(abs(b)+1e-12));
+%         fprintf("IQimb: IRR=%.1f dB, |b/a|=%.3g\n", IRR, abs(b/a));
+%         % =======================================
+% 
+%         % Debug 2: per-frame receive SNR estimated from training symbols
+%         rxTrain = rxEq(1:NtrainSym);
+%         eTrain  = rxTrain - trainSym;
+% 
+%         sigPow = mean(abs(trainSym).^2);
+%         noiPow = mean(abs(eTrain).^2);
+%         snrRx_dB = 10*log10(sigPow / (noiPow + 1e-12));
+% 
+%         fprintf("TrainEVM=%.3f, RX SNR=%.2f dB\n", ...
+%             sqrt(noiPow / (sigPow + 1e-12)), snrRx_dB);
+%         % debug 2
+% 
+%         rxPayload = rxEq(NtrainSym+1:end);
+% 
+%         pilotIndices = (PilotSpacing : PilotSpacing : length(rxPayload)).';
+%         rxPilots = rxPayload(pilotIndices);
+% 
+%         % ===== DEBUG4: pilots 估计复增益 h(k)（包含幅度+相位）=====
+%         hPilots = rxPilots ./ (FixedPilotVal + 1e-12);
+%         hPilots = movmean(hPilots, 3);   % 只对pilot做轻微平滑(3或5)
+% 
+%         magH = abs(hPilots);
+%         fprintf("Pilot |h|: mean=%.3f, std=%.3f (%.1f%%), min=%.3f, max=%.3f\n", ...
+%             mean(magH), std(magH), 100*std(magH)/(mean(magH)+1e-12), min(magH), max(magH));
+% 
+%         p = prctile(magH,[1 50 99]);
+%         fprintf("Pilot |h| percentiles: p1=%.3f, p50=%.3f, p99=%.3f\n", p(1), p(2), p(3));
+%         % ===========================================================
+% 
+%         allIndices = (1:length(rxPayload)).';
+%         if length(pilotIndices) > 1
+%             hInterp = interp1(pilotIndices, hPilots, allIndices, 'linear', 'extrap');
+%         else
+%             hInterp = ones(size(allIndices));
+%         end
+% 
+%         % debug 8
+%         magHi = abs(hInterp);
+%         fprintf("hInterp |.|: min=%.3f, p1=%.3f, p50=%.3f, p99=%.3f\n", ...
+%             min(magHi), prctile(magHi,1), prctile(magHi,50), prctile(magHi,99));
+%         fprintf("count(|hInterp|<0.3)=%d\n", sum(magHi < 0.3));
+%         % debug 8
+% 
+%         % 用复增益去除（同时校正幅度+相位）
+%         rxDataFinal = rxPayload ./ (hInterp + 1e-12);
+% 
+%         % 剔除导频，算 BER
+%         isPilot = false(length(rxDataFinal), 1);
+%         isPilot(pilotIndices) = true;
+%         rxDataOnly = rxDataFinal(~isPilot);
+% 
+%         % ===== DEBUG Step0: 径向/切向误差分解 =====
+%         symHat = qamdemod(rxDataOnly, M, "OutputType","integer", "UnitAveragePower", true);
+%         sIdeal = qammod(double(symHat), M, "InputType","integer", "UnitAveragePower", true);
+% 
+%         e = rxDataOnly - sIdeal;
+%         u = sIdeal ./ (abs(sIdeal)+1e-12);      % 径向单位向量
+%         rad = real(e .* conj(u));               % 径向误差（幅度方向）
+%         tan = imag(e .* conj(u));               % 切向误差（相位方向）
+%         fprintf("STD(rad)=%.4g, STD(tan)=%.4g, ratio=%.2f\n", ...
+%             std(rad), std(tan), std(rad)/(std(tan)+1e-12));
+% 
+%         I = real(sIdeal); Q = imag(sIdeal);
+%         Imax = max(abs(I)); Qmax = max(abs(Q));
+%         isOuter = (abs(I) > 0.9*Imax) & (abs(Q) > 0.9*Qmax);
+% 
+%         evmOuter = rms(e(isOuter)) / (rms(sIdeal(isOuter)) + 1e-12);
+%         evmInner = rms(e(~isOuter)) / (rms(sIdeal(~isOuter)) + 1e-12);
+%         fprintf("EVM outer=%.4f, inner=%.4f, ratio=%.2f\n", evmOuter, evmInner, evmOuter/(evmInner+1e-12));
+%         % ===========================================
+% 
+%         rxBitsHat = qamdemod(rxDataOnly, M, "OutputType","bit", "UnitAveragePower", true);
+%         [numErr, ber] = biterr(dataBits, double(rxBitsHat(:)));
+% 
+%         fprintf('Frame:%4d | CFO:%8.1f Hz | RX SNR:%6.2f dB | BER: %.5f (Err:%d)\n', ...
+%             frameCount, CFO_est, snrRx_dB, ber, numErr);
+% 
+%         set(hScatter, 'XData', real(rxDataOnly), 'YData', imag(rxDataOnly));
+%         title(ax, sprintf('Frame:%d | CFO: %.0f Hz | BER: %.4f', frameCount, CFO_est, ber));
+%         drawnow limitrate;
+% 
+%     catch ME
+%         fprintf('Error: %s\n', ME.message);
+%         rethrow(ME);
+%     end
+% end
+%% ----------------- 6'. 2D DFT codebook 扫描 -----------------
+TX_SN = "BDA-2550009-2800";
+RX_SN = "BDA-2550019-2800";
+
+tlk = py.importlib.import_module('tlkcore_bridge');
+py.importlib.reload(tlk);
+tlk.init(py.list({TX_SN, RX_SN}));
+tlk.set_tx(TX_SN);  tlk.set_rx(RX_SN);
+
+% ---- DFT codebook ----
+Naz = 15;  Nel = 9;
+u_grid = linspace(sin(deg2rad(-60)), sin(deg2rad(60)), Naz);
+v_grid = linspace(sin(deg2rad(-30)), sin(deg2rad(30)), Nel);
+[U, V] = meshgrid(u_grid, v_grid);
+AZ = rad2deg(asin(U));
+EL = rad2deg(asin(V));
+
+dx = sind(AZ) .* cosd(EL);
+dy = sind(EL);
+dz = cosd(AZ) .* cosd(EL);
+THETA = rad2deg(acos(dz));
+PHI   = mod(rad2deg(atan2(dy, dx)), 360);
+THETA(abs(AZ)<1e-6 & abs(EL)<1e-6) = 0;
+PHI(abs(AZ)<1e-6 & abs(EL)<1e-6)   = 0;
+
+metric = nan(Nel, Naz);
+
+tlk.set_beam(RX_SN, int32(0), int32(0));
+pause(0.1);
+
+% USRP 继续 continuous
+transmit(bbtrx, txWave, "continuous");
+
+total = Naz * Nel;
+tic;
+for ii = 1:Nel
+    for jj = 1:Naz
+        if ~ishandle(f), break; end
+        th = int32(round(THETA(ii,jj)));
+        ph = int32(round(PHI(ii,jj)));
+        tlk.set_beam(TX_SN, th, ph);
+        pause(0.03);
+
+        [rx, ~, ~] = capture(bbtrx, capLen);
+        if size(rx,2) > 1, rx = rx(:,1); end
+
+        % ===== 简化指标：用匹配滤波 + STF 峰值做 RSSI =====
+        try
+            rx = rx - mean(rx);
+            rxMF = rxRRC(rx);
+            Ls = Lrep * sps;
+            searchSamp = length(rxMF) - 2*Ls - 1;
+            P = complex(zeros(searchSamp,1,'like',rxMF));
+            R = zeros(searchSamp,1,'like',real(rxMF));
+            for m = 1:2:searchSamp
+                a = rxMF(m:m+Ls-1);
+                b = rxMF(m+Ls:m+2*Ls-1);
+                P(m) = sum(b .* conj(a));
+                R(m) = sum(abs(b).^2);
+            end
+            Mstf = (abs(P).^2) ./ (R.^2 + 1e-9);
+            Mstf(1:50*sps) = 0;
+            metric(ii,jj) = max(Mstf);    % STF 相关峰 = 该波束下信道强度代理
+        catch
+            metric(ii,jj) = NaN;
+        end
+
+        done = (ii-1)*Naz + jj;
+        fprintf('[%3d/%3d] az=%+5.1f° el=%+5.1f° θ=%2d° φ=%3d° metric=%.3f\n', ...
+            done, total, AZ(ii,jj), EL(ii,jj), th, ph, metric(ii,jj));
+    end
+end
+fprintf('Sweep done in %.1f s\n', toc);
+stopTransmission(bbtrx);
+
+% ===== 找最佳 codeword =====
+[bestVal, linIdx] = max(metric(:));
+[bestEl, bestAz]  = ind2sub(size(metric), linIdx);
+fprintf('>>> Best: az=%+.1f° el=%+.1f° (θ=%d° φ=%d°)  metric=%.3f\n', ...
+    AZ(bestEl,bestAz), EL(bestEl,bestAz), ...
+    round(THETA(bestEl,bestAz)), round(PHI(bestEl,bestAz)), bestVal);
+
+% ===== 热力图 =====
+figure('Name','Codebook Heatmap','Color','w');
+imagesc(u_grid, v_grid, 10*log10(metric+1e-12));
+set(gca,'YDir','normal'); axis image; colorbar; colormap jet;
+xlabel('sin(az) = u'); ylabel('sin(el) = v');
+title('DFT Codebook Response (dB)');
+hold on; plot(U(bestEl,bestAz), V(bestEl,bestAz), 'w*', 'MarkerSize',15,'LineWidth',2);
+
+% 锁到最佳
+tlk.set_beam(TX_SN, int32(round(THETA(bestEl,bestAz))), int32(round(PHI(bestEl,bestAz))));
+tlk.shutdown(py.list({TX_SN, RX_SN}));
+%% ====== 辅助函数 ======
+function r = sample1sps_interp(x, tau, sps)
+x = x(:); N = length(x);
+idx = (1+tau) : sps : (N-2*sps);
+t = (1:N).';
+r = interp1(t, x, idx, 'pchip').';
+end
+
+function y = fse_nlms_train_only(x, t0, sps, Nsym, dTrain, Ntaps, mu)
+if mod(Ntaps,2)==0, Ntaps = Ntaps+1; end
+ref = (Ntaps+1)/2;
+x = x(:);
+y = complex(zeros(Nsym,1));
+w = complex(zeros(Ntaps,1));
+w(ref) = 1;
+for m = 1:Nsym
+    t = t0 + (m-1)*sps;
+    i1 = t - (ref-1);
+    i2 = t + (Ntaps-ref);
+    if i1 < 1 || i2 > length(x), break; end
+    xv = x(i1:i2);
+    y(m) = w' * xv;
+    if m <= length(dTrain)
+        e = dTrain(m) - y(m);
+        w = w + (mu/(real(xv'*xv)+1e-6)) * xv * conj(e);
+    end
+end
+end
+
+function cleanupRadio(bbtrx)
+try, stopTransmission(bbtrx); catch, end
+try, clear bbtrx; catch, end
+end
+
+function closeFigureStopTx(figHandle, bbtrx)
+try, stopTransmission(bbtrx); catch, end
+delete(figHandle);
+end

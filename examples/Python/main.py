@@ -996,7 +996,7 @@ def testBBoxDuo(sn, service):
             logger.info("  %-22s -> %s", name, call())
         except Exception as e:
             logger.info("  %-22s -> EXCEPTION %s", name, e)
-
+    # above is the debug for FBS related functions, and below is the normal test code for BBox Duo
     logger.info("MAC: %s" %service.queryMAC(sn))
     logger.info("Static IP: %s" %service.queryStaticIP(sn))
 
