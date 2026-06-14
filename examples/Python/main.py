@@ -38,6 +38,8 @@ else:
     # sys.path.insert(0, os.path.abspath(root_path))
 
 def check_ex_files(directory, extension=".so"):
+    if not os.path.isdir(directory):
+        return False
     for file in os.listdir(directory):
         if file.endswith(extension):
             return True
@@ -57,13 +59,15 @@ try:
         RIS_Dir,
         RIS_ModuleConfig,
         CellRFMode,     # For CloverCell series AiP
-        POLARIZATION    # For CloverCell series AiP
+        POLARIZATION,   # For CloverCell series AiP
+        POLARIZATION_TYPE,
+        ThetaPhiAngle,
     )
 except Exception as e:
     myos = platform.system()
     d = os.path.join(sys.path[0], 'tlkcore',)
-    if ((myos == 'Windows' and check_ex_files(d), ".so")
-        or (myos == 'Linux' and check_ex_files(d), ".pyd")):
+    if ((myos == 'Windows' and check_ex_files(d, ".so"))
+        or (myos == 'Linux' and check_ex_files(d, ".pyd"))):
         print(f"[Main] Import the wrong library for {myos}")
     else:
         print("[Main] Import path has something wrong")
@@ -94,6 +98,68 @@ class TMYLogFileHandler(logging.FileHandler):
 
 def getJSONFmt(data:str):
     return json.dumps(data, indent=4, ensure_ascii=False)
+
+def _ret_ok(ret):
+    return getattr(ret, "RetCode", None) is RetCode.OK
+
+def _ret_data(ret, action, sn=None, address=None):
+    if _ret_ok(ret):
+        return ret.RetData
+    code = getattr(ret, "RetCode", None)
+    msg = getattr(ret, "RetMsg", "")
+    logger.error("%s failed: %s %s", action, code, msg)
+    if sn and address and ("10054" in str(msg) or code is RetCode.ERROR_SEND_CMD_TIMEOUT):
+        _log_duo_port_owner(sn, address)
+    raise RuntimeError("%s failed: %s %s" %(action, code, msg))
+
+def _log_duo_port_owner(sn, address, port=5025):
+    """Diagnose the common case where the TLKCore GUI middleware owns the Duo TCP port."""
+    try:
+        import psutil
+    except Exception:
+        logger.warning(
+            "%s may be held by another TLKCore client. Close the official GUI/middleware and retry.",
+            sn,
+        )
+        return
+
+    owners = []
+    try:
+        for conn in psutil.net_connections(kind="tcp"):
+            raddr = getattr(conn, "raddr", None)
+            if not raddr or len(raddr) < 2:
+                continue
+            if raddr.ip == address and raddr.port == port:
+                name = "pid=%s" %conn.pid
+                try:
+                    name = "%s(pid=%s)" %(psutil.Process(conn.pid).name(), conn.pid)
+                except Exception:
+                    pass
+                owners.append("%s %s:%s -> %s:%s %s" %(
+                    name,
+                    conn.laddr.ip,
+                    conn.laddr.port,
+                    raddr.ip,
+                    raddr.port,
+                    conn.status,
+                ))
+    except Exception as e:
+        logger.warning("Unable to inspect TCP port owner for %s:%s: %s", address, port, e)
+        return
+
+    if owners:
+        logger.error(
+            "%s control port is already owned by another process. Close TLKCore GUI/web-tlk-local-middleware before running Python. Owner(s): %s",
+            sn,
+            "; ".join(owners),
+        )
+    else:
+        logger.error(
+            "%s command port %s:%s was reset. If the official GUI is open, close it before running Python.",
+            sn,
+            address,
+            port,
+        )
 
 def wrapper(*args, **kwarg):
     """It's a wrapper function to help some API developers who can't call TLKCoreService class driectly,
@@ -172,18 +238,23 @@ def startService(root:str=root_path, direct_connect_info:list=None, dfu_image:st
         # So we provide a extend init function to connect device driectly without scanning,
         # the parameter address and devtype could fetch by previous results of scanning.
         # The following is simple example, please modify it
-        kw = {'sn': direct_connect_info[0], 'address':direct_connect_info[1], 'dev_type':int(direct_connect_info[2]), 'is_custom_calibration': False}
+        kw = {'sn': direct_connect_info[0], 'address':direct_connect_info[1], 'dev_type':int(direct_connect_info[2])}
         # Parameter: SN, Address, Devtype
-        ret = service.initDev(**kw)
+        ret = service.initDev(is_custom_calibration=False, **kw)
         if ret.RetCode is RetCode.OK:
             kw['service'] = service
             kw['dfu_image'] = dfu_image
             testDevice(**kw)
+        else:
+            logger.error("initDev failed: %s %s", ret.RetCode, ret.RetMsg)
     else:
         # Please select or combine your interface or not pass any parameters: service.scanDevices()
         interface = DevInterface.ALL #DevInterface.LAN | DevInterface.COMPORT
         logger.info("Searching devices via: %s" %interface)
         ret = service.scanDevices(interface=interface)
+        if ret.RetCode is not RetCode.OK:
+            logger.error("scanDevices failed: %s %s", ret.RetCode, ret.RetMsg)
+            return False
 
         scan_dict = service.getScanInfo().RetData
         i = 0
@@ -192,9 +263,14 @@ def startService(root:str=root_path, direct_connect_info:list=None, dfu_image:st
             logger.info("====== Dev_%d: %s, %s, %d, %r ======" %(i, sn, addr, devtype, in_dfu))
 
             # Init device, the first action for device before the operations
-            if service.initDev(sn, is_custom_calibration=False).RetCode is not RetCode.OK and not in_dfu:
+            ret = service.initDev(sn, addr, int(devtype), is_custom_calibration=False)
+            if ret.RetCode is not RetCode.OK and not in_dfu:
+                logger.error("initDev failed: %s %s", ret.RetCode, ret.RetMsg)
                 continue
-            testDevice(sn, service, dfu_image, addr, devtype, in_dfu)
+            try:
+                testDevice(sn, service, dfu_image, addr, devtype, in_dfu)
+            except RuntimeError as e:
+                logger.error("Skip %s after failure: %s", sn, e)
 
     return True
 
@@ -209,9 +285,9 @@ def testDevice(sn, service, dfu_image:str="", address:str="", dev_type:int=0, in
     if in_dfu:
         logger.info("Device in DFU mode, you can skip error log for previous connection failed")
     else:
-        logger.info("SN: %s" %service.querySN(sn))
-        fw_ver = service.queryFWVer(sn).RetData
-        hw_ver = service.queryHWVer(sn).RetData
+        logger.info("SN: %s" %_ret_data(service.querySN(sn), "querySN", sn, address))
+        fw_ver = _ret_data(service.queryFWVer(sn), "queryFWVer", sn, address)
+        hw_ver = _ret_data(service.queryHWVer(sn), "queryHWVer", sn, address)
         logger.info("FW ver: %s" %fw_ver)
         logger.info("HW ver: %s" %hw_ver)
 
@@ -248,6 +324,7 @@ def testDevice(sn, service, dfu_image:str="", address:str="", dev_type:int=0, in
     else:
         if dev_type == 32:
             dev_name = "BBoxDuo"
+            kw['address'] = address
         elif 'BBoard' in dev_name:
             dev_name = "BBoard"
         elif 'BBox' in dev_name:
@@ -977,95 +1054,90 @@ def testRIS(sn, service):
                 logger.info(f"Get Ptn {i:>2} = {row}")
                 i+=1
 
-def testBBoxDuo(sn, service):
-    logger.info("===== FBS probe on Duo (%s) =====", sn)
-    probes = [
-        ("getBeamIdStorage", lambda: service.getBeamIdStorage(sn)),
-        ("getBeamPattern",   lambda: service.getBeamPattern(sn, RFMode.TX, 1)),
-        ("setBeamPattern",   lambda: service.setBeamPattern(
-                                sn, RFMode.TX, 1, BeamType.BEAM,
-                                {'db': 0, 'theta': 0, 'phi': 0})),
-        ("setFastParallelMode", lambda: service.setFastParallelMode(sn, True)),
-        ("getBeamGainList",  lambda: service.getBeamGainList(sn)),
-        ("getBeamPhaseList", lambda: service.getBeamPhaseList(sn)),
-        ("getAAKitInfo",     lambda: service.getAAKitInfo(sn)),
-        ("getAAKitList",     lambda: service.getAAKitList(sn)),
-    ]
-    for name, call in probes:
-        try:
-            logger.info("  %-22s -> %s", name, call())
-        except Exception as e:
-            logger.info("  %-22s -> EXCEPTION %s", name, e)
+def testBBoxDuo(sn, service, address=""):
+    # logger.info("===== FBS probe on Duo (%s) =====", sn)
+    # probes = [
+    #     ("getBeamIdStorage", lambda: service.getBeamIdStorage(sn)),
+    #     ("getBeamPattern",   lambda: service.getBeamPattern(sn, RFMode.TX, 1)),
+    #     ("setBeamPattern",   lambda: service.setBeamPattern(
+    #                             sn, RFMode.TX, 1, BeamType.BEAM,
+    #                             {'db': 0, 'theta': 0, 'phi': 0})),
+    #     ("setFastParallelMode", lambda: service.setFastParallelMode(sn, True)),
+    #     ("getBeamGainList",  lambda: service.getBeamGainList(sn)),
+    #     ("getBeamPhaseList", lambda: service.getBeamPhaseList(sn)),
+    #     ("getAAKitInfo",     lambda: service.getAAKitInfo(sn)),
+    #     ("getAAKitList",     lambda: service.getAAKitList(sn)),
+    # ]
+    # for name, call in probes:
+    #     try:
+    #         logger.info("  %-22s -> %s", name, call())
+    #     except Exception as e:
+    #         logger.info("  %-22s -> EXCEPTION %s", name, e)
     # above is the debug for FBS related functions, and below is the normal test code for BBox Duo
     logger.info("MAC: %s" %service.queryMAC(sn))
     logger.info("Static IP: %s" %service.queryStaticIP(sn))
 
     logger.info("========= BBox Duo Get functions =========")
 
-    ret = service.getRfFreq(sn).RetData
+    ret = _ret_data(service.getRFFreq(sn), "getRFFreq", sn, address)
     logger.info("Get RF freq: %s kHz" % ret)
 
-    ret = service.getLoFreq(sn).RetData
+    ret = _ret_data(service.getLoFreq(sn), "getLoFreq", sn, address)
     logger.info("Get LO freq: %s kHz" % ret)
 
-    ret = service.getLoStatus(sn).RetData
+    ret = _ret_data(service.getLoStatus(sn), "getLoStatus", sn, address)
     logger.info("Get LO status: %s" % ret)
 
-    ret = service.getRefSource(sn).RetData
+    ret = _ret_data(service.getRefSource(sn), "getRefSource", sn, address)
     logger.info("Get Ref source: %s" % ret)
 
-    ret = service.getTRx(sn).RetData
-    logger.info("Get TRx status: %s" % ret)
+    ret = _ret_data(service.getRFMode(sn), "getRFMode", sn, address)
+    logger.info("Get RF mode: %s" % ret)
 
-    ret = service.checkHarmonic(sn, lo_freq = 22800000, if_freq = 5200000, bandwidth = 675000).RetData
+    ret = _ret_data(
+        service.checkHarmonic(sn, lo_freq=22800000, if_freq=5200000, bandwidth=675000),
+        "checkHarmonic",
+        sn,
+        address,
+    )
     logger.info("Check Harmonic: %s" % ret)
 
     logger.info("========= BBox Duo Set functions =========")
 
-    ret = service.setRfFreq(sn, 28000000).RetData
+    ret = _ret_data(service.setRFFreq(sn, 28000000), "setRFFreq", sn, address)
     logger.info("Set RF freq to 28000000 kHz: %s" % ret)
 
-    ret = service.setLoFreq(sn, 22800000).RetData
+    ret = _ret_data(service.setLoFreq(sn, 22800000), "setLoFreq", sn, address)
     logger.info("Set LO freq to 22800000 kHz: %s" % ret)
 
-    ret = service.setRefSource(sn, 0).RetData
+    ret = _ret_data(service.setRefSource(sn, 0), "setRefSource", sn, address)
     logger.info("Set Ref source to INTERNAL: %s" % ret)
-
-    ret = service.setBeam(sn, theta = 0, phi = 0).RetData
-    logger.info("Set Beam to theta=0, phi=0: %s" % ret)
 
     TX_SN = "BDA-2550009-2800"   
     RX_SN = "BDA-2550019-2800"  
 
     if sn == TX_SN:
-        role = 1          # TX
+        mode = CellRFMode.TX
     elif sn == RX_SN:
-        role = 2          # RX
+        mode = CellRFMode.RX
     else:
-        role = 2          # 其它（没接的）默认 RX
-    # ret = service.setTRx(sn, role).RetData
-    # logger.info("Set TRx to %s (%s): %s" % (role, "TX" if role == 1 else "RX", ret))
+        mode = CellRFMode.RX
 
+    ret = _ret_data(service.setRFMode(sn, mode), "setRFMode", sn, address)
+    logger.info("Set RF mode to %s: %s" % (mode.name, ret))
 
-    # ret = service.setRxUdAtt(sn, 0).RetData
-    # logger.info("Set RX user attenuation to 0: %s" % ret)
+    polar = POLARIZATION_TYPE.POL_1
+    ret = _ret_data(service.setUdGain(sn, polar, mode, 20.0), "setUdGain", sn, address)
+    logger.info("Set %s/%s UD gain=20 dB: %s" %(mode.name, polar.name, ret))
 
-    # ret = service.setTxUdAtt(sn, 0).RetData
-    # logger.info("Set TX user attenuation to 0: %s" % ret)
-
-    ret = service.setTRx(sn, role).RetData
-    logger.info("Set TRx to %s (%s): %s" % (role, "TX" if role == 1 else "RX", ret))
-
-    time.sleep(0.1)                                    # 给硬件切换 + PLO 重锁时间
-
-    if role == 1:   # TX
-        ret = service.setTxUdAtt(sn, 0)
-        logger.info("Set TX att=0: RetCode=%s RetMsg=%s RetData=%s"
-                    % (ret.RetCode, ret.RetMsg, ret.RetData))
-    elif role == 2: # RX
-        ret = service.setRxUdAtt(sn, 0)
-        logger.info("Set RX att=0: RetCode=%s RetMsg=%s RetData=%s"
-                    % (ret.RetCode, ret.RetMsg, ret.RetData))
+    ret = _ret_data(service.setBeamAngle(
+        sn,
+        polar,
+        mode,
+        ThetaPhiAngle(theta=0, phi=0),
+        20.0,
+    ), "setBeamAngle", sn, address)
+    logger.info("Set %s/%s beam to theta=0, phi=0: %s" % (mode.name, polar.name, ret))
 
 
 def startDFU(sn, service, dfu_image:str, dfu_dev_info:dict):

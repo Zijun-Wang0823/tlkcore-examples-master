@@ -386,10 +386,15 @@ capLen = 3 * frameLenSamp;  % 抓长一点，保证含一整帧
 %% ----------------- 6'. 2D DFT codebook 扫描 -----------------
 TX_SN = "BDA-2550009-2800";
 RX_SN = "BDA-2550019-2800";
+duoRfFreq_kHz = int32(28000000);
+duoIfFreq_kHz = int32(round(fc_Hz/1e3));
+duoRefSource = int32(0);
+duoGain_dB = 20.0;
+duoPolarization = "pol_1";
 
 tlk = py.importlib.import_module('tlkcore_bridge');
 py.importlib.reload(tlk);
-tlk.init(py.list({TX_SN, RX_SN}));
+tlk.init(py.list({TX_SN, RX_SN}), duoRfFreq_kHz, duoIfFreq_kHz, duoRefSource, duoGain_dB);
 tlk.set_tx(TX_SN);  tlk.set_rx(RX_SN);
 
 % ---- DFT codebook ----
@@ -410,7 +415,7 @@ PHI(abs(AZ)<1e-6 & abs(EL)<1e-6)   = 0;
 
 metric = nan(Nel, Naz);
 
-tlk.set_beam(RX_SN, int32(0), int32(0));
+tlk.set_beam(RX_SN, int32(0), int32(0), duoPolarization, "rx", duoGain_dB);
 pause(0.1);
 
 % USRP 继续 continuous
@@ -423,7 +428,7 @@ for ii = 1:Nel
         if ~ishandle(f), break; end
         th = int32(round(THETA(ii,jj)));
         ph = int32(round(PHI(ii,jj)));
-        tlk.set_beam(TX_SN, th, ph);
+        tlk.set_beam(TX_SN, th, ph, duoPolarization, "tx", duoGain_dB);
         pause(0.03);
 
         [rx, ~, ~] = capture(bbtrx, capLen);
@@ -480,7 +485,8 @@ title('DFT Codebook Response (dB)');
 hold on; plot(U(bestEl,bestAz), V(bestEl,bestAz), 'w*', 'MarkerSize',15,'LineWidth',2);
 
 % 锁到最佳
-tlk.set_beam(TX_SN, int32(round(THETA(bestEl,bestAz))), int32(round(PHI(bestEl,bestAz))));
+tlk.set_beam(TX_SN, int32(round(THETA(bestEl,bestAz))), int32(round(PHI(bestEl,bestAz))), ...
+    duoPolarization, "tx", duoGain_dB);
 tlk.shutdown(py.list({TX_SN, RX_SN}));
 %% ====== 辅助函数 ======
 function r = sample1sps_interp(x, tau, sps)

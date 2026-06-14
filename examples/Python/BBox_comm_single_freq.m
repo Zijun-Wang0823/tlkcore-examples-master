@@ -1,6 +1,11 @@
 clear all; clc; close all;
 set(0, 'DefaultFigureWindowStyle', 'normal');
 
+%% ----------------- 0. Python/TLKCore 路径 -----------------
+pythonExe = "C:\Software\Python\python.exe";
+tlkPythonDir = "C:\BBox 8x8 Duo\tlkcore-examples-master\examples\Python";
+ensurePythonEnv(pythonExe, tlkPythonDir);
+
 %% ----------------- 1. 参数定义 -----------------
 M   = 16; k = log2(M); sps = 2;
 Rs  = 1e6/sps; Fs = Rs*sps;
@@ -32,8 +37,26 @@ agc = comm.AGC("AveragingLength", 100, "DesiredOutputPower", 1, "MaxPowerGain", 
 %% ----------------- 3. USRP X410 配置 -----------------
 radioID   = "tempRadio";
 fc_Hz     = 5.2e9;
-txGain_dB = 10;
-rxGain_dB = 0;
+txGain_dB = 30;
+rxGain_dB = 40;
+
+%% ----------------- 3a. BBox Duo 配置 -----------------
+TX_SN = "BDA-2550009-2800";
+RX_SN = "BDA-2550019-2800";
+
+bbox.rfFreq_kHz = int32(28000000);          % BBox RF: 28 GHz
+bbox.ifFreq_kHz = int32(round(fc_Hz/1e3));  % USRP IF: 5.2 GHz
+bbox.loFreq_kHz = bbox.rfFreq_kHz - bbox.ifFreq_kHz;
+bbox.refSource = int32(0);                  % 0=internal, 1=external 10M, 2=external 100M
+bbox.udGain_dB = 20.0;                      % Duo v2.4.9 setUdGain range: 0..30 dB
+bbox.beamGain_dB = bbox.udGain_dB;          % setBeamAngle gain_db is total Duo gain in v2.4.9
+bbox.elementsPerPolarization = 64;          % BBox 8x8: 64 elements per polarization
+bbox.activePolarization = "pol_1";          % 当前使用的 polarization
+bbox.otherPolarization = "pol_2";           % 另一路 polarization
+bbox.enableOtherPolarization = false;       % 需要 pol_2 时改 true
+bbox.commonBficGain_dB = 5.0;
+bbox.elementConfigCsv = fullfile(tlkPythonDir, "bbox_element_config.csv");
+bbox = loadDuoElementConfigCsv(bbox, bbox.elementConfigCsv);
 
 txAntenna = "DB0:RF0:TX/RX0";
 rxAntenna = "DB0:RF0:RX1";
@@ -383,19 +406,14 @@ capLen = 3 * frameLenSamp;  % 抓长一点，保证含一整帧
 %         rethrow(ME);
 %     end
 % end
-%% ----------------- 6'. 固定 0° 持续监测 -----------------
-TX_SN = "BDA-2550009-2800";
-RX_SN = "BDA-2550019-2800";
-
+%% ----------------- 6'. BBox 上/下变频 + 固定 0° 持续监测 -----------------
 tlk = py.importlib.import_module('tlkcore_bridge');
 py.importlib.reload(tlk);
-tlk.init(py.list({TX_SN, RX_SN}));
-tlk.set_tx(TX_SN);
-tlk.set_rx(RX_SN);
+tlk.init(py.list({TX_SN, RX_SN}), bbox.rfFreq_kHz, bbox.ifFreq_kHz, ...
+    bbox.refSource, bbox.udGain_dB);
+tlkCleanupObj = onCleanup(@()cleanupTlk(tlk, {TX_SN, RX_SN}));
 
-% 把两台都锁到 θ=0°, φ=0°
-tlk.set_beam(TX_SN, int32(0), int32(0));
-tlk.set_beam(RX_SN, int32(0), int32(0));
+configureDuoLink(tlk, TX_SN, RX_SN, bbox);
 pause(0.1);
 
 transmit(bbtrx, txWave, "continuous");
@@ -572,6 +590,124 @@ end
 stopTransmission(bbtrx);
 tlk.shutdown(py.list({TX_SN, RX_SN}));
 %% ====== 辅助函数 ======
+function ensurePythonEnv(pythonExe, moduleDir)
+pe = pyenv;
+if pe.Status == "NotLoaded"
+    pyenv('Version', char(pythonExe));
+elseif string(pe.Executable) ~= pythonExe
+    warning("MATLAB Python is already loaded from %s, not %s.", ...
+        string(pe.Executable), pythonExe);
+end
+
+moduleDirChar = char(moduleDir);
+if ~isPythonPathPresent(moduleDirChar)
+    insert(py.sys.path, int32(0), moduleDirChar);
+end
+end
+
+function tf = isPythonPathPresent(moduleDir)
+tf = false;
+pyPaths = cell(py.sys.path);
+for ii = 1:numel(pyPaths)
+    if strcmp(char(pyPaths{ii}), moduleDir)
+        tf = true;
+        return;
+    end
+end
+end
+
+function configureDuoLink(tlk, txSn, rxSn, bbox)
+tlk.set_tx(txSn);
+tlk.set_rx(rxSn);
+
+applyDuoPolarization(tlk, txSn, rxSn, bbox, bbox.activePolarization);
+if bbox.enableOtherPolarization
+    applyDuoPolarization(tlk, txSn, rxSn, bbox, bbox.otherPolarization);
+end
+end
+
+function bbox = loadDuoElementConfigCsv(bbox, csvFile)
+if ~isfile(csvFile)
+    error("BBox element config CSV not found: %s", csvFile);
+end
+
+cfg = readtable(csvFile, "TextType", "string");
+requiredColumns = ["Role", "Polarization", "Parameter", "Row", ...
+    "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"];
+missingColumns = setdiff(requiredColumns, string(cfg.Properties.VariableNames));
+if ~isempty(missingColumns)
+    error("BBox element config CSV missing columns: %s", strjoin(missingColumns, ", "));
+end
+
+roles = ["tx", "rx"];
+polarizations = ["pol_1", "pol_2"];
+parameters = ["gain_dB", "phase_deg", "enable"];
+
+for rr = 1:numel(roles)
+    for pp = 1:numel(polarizations)
+        polField = matlab.lang.makeValidName(char(polarizations(pp)));
+        for kk = 1:numel(parameters)
+            values = nan(8, 8);
+            for row = 1:8
+                match = lower(strtrim(cfg.Role)) == roles(rr) & ...
+                    lower(strtrim(cfg.Polarization)) == polarizations(pp) & ...
+                    strcmp(strtrim(cfg.Parameter), parameters(kk)) & ...
+                    cfg.Row == row;
+                if sum(match) ~= 1
+                    error("CSV must contain exactly one row for %s/%s/%s row %d.", ...
+                        roles(rr), polarizations(pp), parameters(kk), row);
+                end
+                values(row, :) = table2array(cfg(match, compose("C%d", 1:8)));
+            end
+            bbox.(char(roles(rr))).(polField).(char(parameters(kk))) = values;
+        end
+    end
+end
+end
+
+function applyDuoPolarization(tlk, txSn, rxSn, bbox, polarization)
+polField = matlab.lang.makeValidName(char(polarization));
+
+txCfg = bbox.tx.(polField);
+rxCfg = bbox.rx.(polField);
+validateElementConfig(txCfg, bbox.elementsPerPolarization, "TX " + polarization);
+validateElementConfig(rxCfg, bbox.elementsPerPolarization, "RX " + polarization);
+
+tlk.set_tx_gain(txSn, bbox.udGain_dB, polarization);
+tlk.set_rx_gain(rxSn, bbox.udGain_dB, polarization);
+tlk.set_beam(txSn, int32(0), int32(0), polarization, "tx", bbox.beamGain_dB);
+tlk.set_beam(rxSn, int32(0), int32(0), polarization, "rx", bbox.beamGain_dB);
+
+tlk.set_all_element_gain_phase(txSn, matlabToPyList(txCfg.gain_dB), ...
+    matlabToPyList(txCfg.phase_deg), polarization, "tx", matlabToPyList(txCfg.enable), ...
+    bbox.commonBficGain_dB, int32(bbox.elementsPerPolarization));
+tlk.set_all_element_gain_phase(rxSn, matlabToPyList(rxCfg.gain_dB), ...
+    matlabToPyList(rxCfg.phase_deg), polarization, "rx", matlabToPyList(rxCfg.enable), ...
+    bbox.commonBficGain_dB, int32(bbox.elementsPerPolarization));
+end
+
+function validateElementConfig(cfg, expectedCount, label)
+if numel(cfg.gain_dB) ~= expectedCount
+    error("%s gain_dB must contain %d elements.", label, expectedCount);
+end
+if numel(cfg.phase_deg) ~= expectedCount
+    error("%s phase_deg must contain %d elements.", label, expectedCount);
+end
+if numel(cfg.enable) ~= expectedCount
+    error("%s enable must contain %d elements.", label, expectedCount);
+end
+end
+
+function p = matlabToPyList(v)
+v = double(v);
+if ismatrix(v) && size(v, 1) > 1 && size(v, 2) > 1
+    v = reshape(v.', 1, []);
+else
+    v = v(:).';
+end
+p = py.list(num2cell(v));
+end
+
 function r = sample1sps_interp(x, tau, sps)
 x = x(:); N = length(x);
 idx = (1+tau) : sps : (N-2*sps);
@@ -601,11 +737,27 @@ end
 end
 
 function cleanupRadio(bbtrx)
-try, stopTransmission(bbtrx); catch, end
-try, clear bbtrx; catch, end
+try
+    stopTransmission(bbtrx);
+catch
+end
+try
+    clear bbtrx;
+catch
+end
+end
+
+function cleanupTlk(tlk, snCell)
+try
+    tlk.shutdown(py.list(snCell));
+catch
+end
 end
 
 function closeFigureStopTx(figHandle, bbtrx)
-try, stopTransmission(bbtrx); catch, end
+try
+    stopTransmission(bbtrx);
+catch
+end
 delete(figHandle);
 end
